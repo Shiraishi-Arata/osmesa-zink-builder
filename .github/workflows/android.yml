@@ -1,36 +1,80 @@
 name: Build Android
 
 on:
-  [push, pull_request, workflow_dispatch]
+  push:
+  pull_request:
+  workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   build:
     strategy:
       matrix:
-        arch: [ "arm32", "aarch64", "x86_64"]
+        arch: [arm32, aarch64, x86_64]
       fail-fast: false
 
-    name: "Build for ${{matrix.arch}}"
-
+    name: Build for ${{ matrix.arch }}
     runs-on: ubuntu-latest
 
-    steps:        
-      - uses: actions/checkout@v2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Build
+      - name: Install system dependencies
         run: |
           sudo apt update
-          sudo apt install -y meson libxrandr-dev libxxf86vm-dev libxcb-*-dev libx11-xcb-dev libxfixes-dev libdrm-dev libx11-dev
+          sudo apt install -y \
+            meson \
+            libxrandr-dev \
+            libxxf86vm-dev \
+            libxcb-*-dev \
+            libx11-xcb-dev \
+            libxfixes-dev \
+            libdrm-dev \
+            libx11-dev \
+            gettext   # provides envsubst
           pip3 install mako
-          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk-bundle"
-          envsubst <android-${{matrix.arch}} >build-crossfile
-          git clone --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git
-          cd mesa
-          git apply --reject --whitespace=fix ../mesa-zink.diff || echo "git apply failed"
-          meson setup "build-android" \
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c
+          add-to-path: false
+          local-cache: true
+
+      - name: Set NDK environment
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+
+      - name: Generate Meson cross file
+        run: |
+          envsubst < "android-${{ matrix.arch }}" > build-crossfile
+
+      - name: Cache Mesa build
+        uses: actions/cache@v4
+        with:
+          path: mesa/build-android
+          key: mesa-android-${{ matrix.arch }}-${{ hashFiles('mesa-zink.diff', 'build-crossfile') }}
+          restore-keys: |
+            mesa-android-${{ matrix.arch }}-
+
+      - name: Clone Mesa
+        run: git clone --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git
+
+      - name: Apply Zink patch
+        working-directory: mesa
+        run: |
+          if ! git apply --check --whitespace=fix ../mesa-zink.diff; then
+            echo "Patch check failed. Attempting to apply anyway..."
+          fi
+          git apply --reject --whitespace=fix ../mesa-zink.diff || echo "Patch applied with warnings (rejected hunks may cause build issues)"
+
+      - name: Configure Mesa with Meson
+        working-directory: mesa
+        run: |
+          meson setup build-android \
             --prefix=/tmp/zink \
-            --cross-file "../build-crossfile" \
+            --cross-file ../build-crossfile \
             -Dplatforms=android \
             -Dplatform-sdk-version=25 \
             -Dandroid-stub=true \
@@ -46,9 +90,15 @@ jobs:
             -Dshared-glapi=false \
             -Dandroid-libbacktrace=disabled \
             -Dbuildtype=release
-          ninja -C "build-android" install
+
+      - name: Build and install Mesa
+        working-directory: mesa
+        run: |
+          ninja -C build-android
+          ninja -C build-android install
+
       - name: Upload libraries
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
-          name: libzink_${{matrix.arch}}
+          name: libzink_${{ matrix.arch }}
           path: /tmp/zink
